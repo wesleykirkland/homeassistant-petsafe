@@ -112,52 +112,44 @@ class PetSafeLitterboxSensorEntity(PetSafeSensorEntity):
         return super()._handle_coordinator_update()
 
     async def async_update(self) -> None:
-
         if self._device_type == "last_cleaning":
             data: PetSafeData = self.coordinator.data
             litterbox: petsafe.devices.DeviceScoopfree = next(
                 x for x in data.litterboxes if x.api_name == self._api_name
             )
             events = await litterbox.get_activity()
-            reversed_events = reversed(events["data"])
-            for item in reversed_events:
-                if item["payload"]["code"] == RAKE_FINISHED:
-                    self._attr_native_value = datetime.datetime.fromtimestamp(
-                        int(item["payload"]["timestamp"]) / 1000, pytz.timezone("UTC")
-                    )
-                    break
+            self._attr_native_value = self._get_last_cleaning_time(events["data"])
         elif self._device_type == "rake_status":
             data: PetSafeData = self.coordinator.data
             litterbox: petsafe.devices.DeviceScoopfree = next(
                 x for x in data.litterboxes if x.api_name == self._api_name
             )
             events = await litterbox.get_activity()
-            reversed_events = reversed(events["data"])
-            status = None
-            for item in reversed_events:
-                code = item["payload"]["code"]
-                if code == RAKE_FINISHED:
-                    status = "idle"
-                    break
-                elif code == CAT_IN_BOX:
-                    status = "timing"
-                    timestamp = int(item["payload"]["timestamp"]) / 1000
-                    rake_timer_in_seconds = (
-                        litterbox.data["shadow"]["state"]["reported"]["rakeDelayTime"]
-                        * 60
-                    )
-                    if timestamp + rake_timer_in_seconds <= time.time():
-                        status = "raking"
-                    break
-                elif code == RAKE_BUTTON_DETECTED or code == RAKE_NOW:
-                    status = "raking"
-                    break
-                elif code == ERROR_SENSOR_BLOCKED:
-                    status = "jammed"
-                    break
-            self._attr_native_value = status
-
+            self._attr_native_value = self._get_rake_status(events["data"], litterbox)
         return await super().async_update()
+
+    def _get_last_cleaning_time(self, events):
+        for item in reversed(events):
+            if item["payload"]["code"] == RAKE_FINISHED:
+                return datetime.datetime.fromtimestamp(
+                    int(item["payload"]["timestamp"]) / 1000, pytz.timezone("UTC")
+                )
+        return self._attr_native_value
+
+    def _get_rake_status(self, events, litterbox: petsafe.devices.DeviceScoopfree):
+        for item in reversed(events):
+            code = item["payload"]["code"]
+            if code == RAKE_FINISHED:
+                return "idle"
+            if code == CAT_IN_BOX:
+                timestamp = int(item["payload"]["timestamp"]) / 1000
+                delay = litterbox.data["shadow"]["state"]["reported"]["rakeDelayTime"] * 60
+                return "raking" if timestamp + delay <= time.time() else "timing"
+            if code in (RAKE_BUTTON_DETECTED, RAKE_NOW):
+                return "raking"
+            if code == ERROR_SENSOR_BLOCKED:
+                return "jammed"
+        return None
 
 
 class PetSafeFeederSensorEntity(PetSafeSensorEntity):
@@ -230,10 +222,16 @@ class PetSafeFeederSensorEntity(PetSafeSensorEntity):
             feeder: petsafe.devices.DeviceSmartFeed = next(
                 x for x in data.feeders if x.api_name == self._api_name
             )
-            feeding = await feeder.get_last_feeding()
-            self._attr_native_value = datetime.datetime.fromtimestamp(
-                feeding["payload"]["time"], pytz.timezone("UTC")
-            )
+            messages = await feeder.get_messages_since(days=7)
+            # Messages are sorted oldest-first; iterate in reverse to find the most recent FEED_DONE
+            for message in reversed(messages):
+                if message.get("message_type") == "FEED_DONE":
+                    ts = message.get("payload", {}).get("time")
+                    if ts is not None:
+                        self._attr_native_value = datetime.datetime.fromtimestamp(
+                            ts, pytz.timezone("UTC")
+                        )
+                    break
         if self._device_type == "next_feeding":
             data: PetSafeData = self.coordinator.data
             feeder: petsafe.devices.DeviceSmartFeed = next(
